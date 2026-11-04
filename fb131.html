@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FB131 Companion</title>
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--line:#262a33;--text:#e8eaf0;--mute:#8b92a3;--acc:#ff6a3d;--ok:#3ecf8e;--warn:#f5b84b;--err:#ff5c6c}
+  @media (prefers-color-scheme: light){:root{--bg:#f4f5f8;--card:#fff;--line:#e3e6ec;--text:#14161b;--mute:#667085;--acc:#e8552a;--ok:#15965f;--warn:#b7791f;--err:#d92d3f}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:16px;padding-top:max(16px,env(safe-area-inset-top))}
+  main{max-width:480px;margin:0 auto;display:grid;gap:12px}
+  h1{font-size:22px;margin:4px 0 0}
+  .sub{color:var(--mute);font-size:13px;margin:0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .status{display:flex;align-items:center;gap:8px;font-weight:600}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--mute)}
+  .dot.on{background:var(--ok)} .dot.busy{background:var(--warn)}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat .k{color:var(--mute);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .stat .v{font-size:20px;font-weight:650;margin-top:2px;font-variant-numeric:tabular-nums}
+  .bar{height:6px;background:var(--line);border-radius:3px;margin-top:6px;overflow:hidden}
+  .bar>i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s}
+  button{appearance:none;border:0;border-radius:12px;padding:14px;font:600 16px inherit;font-family:inherit;width:100%;background:var(--line);color:var(--text);cursor:pointer}
+  button.primary{background:var(--acc);color:#fff}
+  button:disabled{opacity:.45}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  details summary{cursor:pointer;color:var(--mute);font-size:14px}
+  #log{font:12px/1.45 ui-monospace,Menlo,monospace;color:var(--mute);max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin-top:8px}
+  .note{font-size:13px;color:var(--mute)}
+  .err{color:var(--err)}
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>FB131 Companion</h1>
+    <p class="sub">Fire-Boltt 131 · direct Bluetooth, no vendor app</p>
+  </div>
+
+  <div class="card row">
+    <div class="status"><span class="dot" id="dot"></span><span id="state">Not connected</span></div>
+    <div style="width:140px"><button class="primary" id="btnConn">Connect</button></div>
+  </div>
+
+  <div class="card stats">
+    <div class="stat"><div class="k">Battery</div><div class="v" id="batt">–</div><div class="bar"><i id="battBar"></i></div></div>
+    <div class="stat"><div class="k">Voltage</div><div class="v" id="mv">–</div></div>
+    <div class="stat"><div class="k">Firmware</div><div class="v" id="fw" style="font-size:15px">–</div></div>
+    <div class="stat"><div class="k">Model</div><div class="v" id="model" style="font-size:15px">–</div></div>
+  </div>
+
+  <div class="card grid">
+    <button id="btnTime" disabled>Sync time</button>
+    <button id="btnFind" disabled>Find watch</button>
+    <button id="btnRefresh" disabled style="grid-column:span 2">Refresh info</button>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Experimental (replays captured frames, unverified)</summary>
+      <div class="grid" style="margin-top:10px">
+        <button id="btnCall" disabled>Test call alert</button>
+        <button id="btnEnd" disabled>Dismiss (0x6F)</button>
+      </div>
+    </details>
+  </div>
+
+  <div class="card">
+    <details open>
+      <summary>Log</summary>
+      <div id="log"></div>
+    </details>
+  </div>
+
+  <p class="note" id="support"></p>
+</main>
+
+<script>
+// ---- Protocol (reverse-engineered from FB Active HCI capture, verified on device) ----
+// Frame: BC | CMD | TYPE | LEN | PAYLOAD | CHK   TYPE 01=query 02=set 03=response   CHK=sum(payload)&0xFF
+const SERVICE = '000001ff-3c17-d293-8e48-14fe2e4da212';
+const WRITE   = '0000ff02-0000-1000-8000-00805f9b34fb';
+const NOTIFY  = '0000ff03-0000-1000-8000-00805f9b34fb';
+
+const $ = id => document.getElementById(id);
+const hex = b => [...b].map(x => x.toString(16).padStart(2,'0')).join('');
+let device, wChar, nChar;
+
+function log(msg, cls){ const d=document.createElement('div'); if(cls) d.className=cls;
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg; $('log').prepend(d); }
+
+function frame(cmd, type, payload = [0]) {
+  const p = Uint8Array.from(payload);
+  const sum = p.reduce((a,b) => (a+b) & 0xff, 0);
+  return Uint8Array.from([0xBC, cmd, type, p.length, ...p, sum]);
+}
+
+async function send(cmd, type, payload) {
+  const f = frame(cmd, type, payload);
+  log('→ ' + hex(f));
+  if (wChar.writeValueWithoutResponse) await wChar.writeValueWithoutResponse(f);
+  else await wChar.writeValue(f);
+  await new Promise(r => setTimeout(r, 150));
+}
+
+function onNotify(e) {
+  const d = new Uint8Array(e.target.value.buffer);
+  if (d[0] !== 0xBC || d.length < 5) { log('← raw ' + hex(d)); return; }
+  const cmd = d[1], len = d[3], p = d.slice(4, 4 + len);
+  const ok = (p.reduce((a,b)=>(a+b)&0xff,0)) === d[4+len];
+  if (!ok) { log('← bad checksum ' + hex(d), 'err'); return; }
+  const txt = () => new TextDecoder().decode(p);
+  switch (cmd) {
+    case 0x3E: $('fw').textContent = txt(); break;
+    case 0x3C: $('model').textContent = txt(); break;
+    case 0x48: {
+      const pct = p[0], mv = p[1] | (p[2] << 8);
+      $('batt').textContent = pct + '%'; $('mv').textContent = mv + ' mV';
+      $('battBar').style.width = pct + '%';
+      $('battBar').style.background = pct < 20 ? 'var(--err)' : pct < 40 ? 'var(--warn)' : 'var(--ok)';
+      break; }
+    case 0x7A: log('← call identity: ' + new TextDecoder().decode(p.slice(6))); return;
+  }
+  log('← 0x' + cmd.toString(16).padStart(2,'0') + ' ' + hex(p));
+}
+
+function setState(text, cls) {
+  $('state').textContent = text; $('dot').className = 'dot ' + (cls || '');
+  const on = cls === 'on';
+  ['btnTime','btnFind','btnRefresh','btnCall','btnEnd'].forEach(id => $(id).disabled = !on);
+  $('btnConn').textContent = on ? 'Disconnect' : 'Connect';
+}
+
+async function refresh(){ await send(0x3E,1); await send(0x3C,1); await send(0x48,1); }
+
+async function syncTime() {
+  // Watch expects LOCAL wall-clock time encoded as a UTC epoch (verified)
+  const now = new Date();
+  const local = Math.floor(now.getTime()/1000) - now.getTimezoneOffset()*60;
+  await send(0x43, 2, [local & 0xff, (local>>8)&0xff, (local>>16)&0xff, (local>>24)&0xff]);
+  log('Time synced to ' + now.toLocaleTimeString());
+}
+
+async function connect() {
+  try {
+    setState('Searching…', 'busy');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'FireBoltt' }], optionalServices: [SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', () => { setState('Disconnected'); log('Disconnected'); });
+    setState('Connecting…', 'busy');
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    wChar = await svc.getCharacteristic(WRITE);
+    nChar = await svc.getCharacteristic(NOTIFY);
+    await nChar.startNotifications();
+    nChar.addEventListener('characteristicvaluechanged', onNotify);
+    setState('Connected · ' + (device.name || 'watch'), 'on');
+    await refresh();
+    await syncTime();
+  } catch (e) { setState('Not connected'); log(e.message || String(e), 'err'); }
+}
+
+$('btnConn').onclick = () => device?.gatt?.connected ? device.gatt.disconnect() : connect();
+$('btnTime').onclick = syncTime;
+$('btnFind').onclick = () => send(0x00, 2);
+$('btnRefresh').onclick = refresh;
+// Exact frame captured from FB Active for an incoming call ("Unknown caller")
+$('btnCall').onclick = () => send(0x0B, 2, [0x01,0x0e,0x0e, ...new TextEncoder().encode('Unknown caller: Unknown caller')]);
+$('btnEnd').onclick = () => send(0x6F, 2);
+
+if (!navigator.bluetooth) {
+  $('support').innerHTML = '<span class="err">Web Bluetooth is not available in this browser.</span> On iPhone, open this page in the free <b>Bluefy</b> browser. On Android/desktop, use Chrome or Edge.';
+  $('btnConn').disabled = true;
+}
+</script>
+</body>
+</html>
